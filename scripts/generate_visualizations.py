@@ -26,6 +26,7 @@ python generate_visualizations.py [data_dir] [meta_file] [--overwrite]
 """
 
 import argparse
+import concurrent.futures
 import csv
 import math
 import os
@@ -264,6 +265,53 @@ def rasterize(svg, full_path, thumb_path):
     )
 
 
+_worker_tok_lengths = None
+
+
+def _init_worker(tok_lengths):
+    """ProcessPoolExecutor initializer: stash tok_lengths once per worker
+    instead of pickling/sending it with every task."""
+    global _worker_tok_lengths
+    _worker_tok_lengths = tok_lengths
+
+
+def output_paths(bk1, bk2):
+    svg_path = os.path.join(SVG_DIR, bk1, f"{bk1}_{bk2}.svg")
+    full_path = os.path.join(PNG_DIR, bk1, f"{bk1}_{bk2}.png")
+    thumb_path = os.path.join(THUMBNAIL_DIR, bk1, f"{bk1}_{bk2}.png")
+    return svg_path, full_path, thumb_path
+
+
+def outputs_exist(bk1, bk2):
+    return all(os.path.exists(p) for p in output_paths(bk1, bk2))
+
+
+def process_pair(bk1, bk2, csv_path):
+    """Build+rasterize one <bk1>/<bk2> pair. Runs in a worker process.
+
+    Callers are expected to have already skipped pairs whose outputs exist
+    (see outputs_exist), so this always (re)generates.
+    """
+    data_set = load_dataset(csv_path)
+    if not data_set:
+        return "skipped", bk1, bk2
+
+    tok_length1 = _worker_tok_lengths.get(bk1, 0)
+    tok_length2 = _worker_tok_lengths.get(bk2, 0)
+
+    svg_path, full_path, thumb_path = output_paths(bk1, bk2)
+    os.makedirs(os.path.dirname(svg_path), exist_ok=True)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
+
+    svg = build_svg(data_set, tok_length1, tok_length2)
+    with open(svg_path, "w", encoding="utf-8") as f:
+        f.write(svg)
+
+    rasterize(svg, full_path, thumb_path)
+    return "generated", bk1, bk2
+
+
 def iter_csv_files(data_dir):
     """Yield (bk1, bk2, csv_path) for each <data_dir>/<bk1>/<bk1>_<bk2>.csv file."""
     for bk1 in sorted(os.listdir(data_dir)):
@@ -297,9 +345,15 @@ def main():
     )
     parser.add_argument(
         "--overwrite",
-        default=False, 
+        default=False,
         action=argparse.BooleanOptionalAction,
         help="Overwrite existing visualizations (default: False)"
+    )
+    parser.add_argument(
+        "-j", "--workers",
+        type=int,
+        default=os.cpu_count() or 4,
+        help="Number of worker processes to rasterize in parallel (default: all cores)"
     )
 
     args = parser.parse_args()
@@ -308,39 +362,32 @@ def main():
 
     tok_lengths = load_tok_lengths(args.meta_file)
 
+    tasks = list(iter_csv_files(args.data_dir))
+
     generated, skipped, existed = 0, 0, 0
-    for bk1, bk2, csv_path in iter_csv_files(args.data_dir):
-        data_set = load_dataset(csv_path)
-        if not data_set:
-            skipped += 1
-            continue
+    if not overwrite:
+        pending = []
+        for bk1, bk2, csv_path in tasks:
+            if outputs_exist(bk1, bk2):
+                existed += 1
+            else:
+                pending.append((bk1, bk2, csv_path))
+        tasks = pending
 
-        tok_length1 = tok_lengths.get(bk1, 0)
-        tok_length2 = tok_lengths.get(bk2, 0)
-
-
-        svg_subdir = os.path.join(SVG_DIR, bk1)
-        png_subdir = os.path.join(PNG_DIR, bk1)
-        thumb_subdir = os.path.join(THUMBNAIL_DIR, bk1)
-        os.makedirs(svg_subdir, exist_ok=True)
-        os.makedirs(png_subdir, exist_ok=True)
-        os.makedirs(thumb_subdir, exist_ok=True)
-
-        svg_path = os.path.join(svg_subdir, f"{bk1}_{bk2}.svg")
-        full_path = os.path.join(png_subdir, f"{bk1}_{bk2}.png")
-        thumb_path = os.path.join(thumb_subdir, f"{bk1}_{bk2}.png")
-
-        if not overwrite and os.path.exists(svg_path) and os.path.exists(full_path) and os.path.exists(thumb_path):
-            existed += 1
-            continue
-
-        svg = build_svg(data_set, tok_length1, tok_length2)
-        with open(svg_path, "w", encoding="utf-8") as f:
-            f.write(svg)
-
-        rasterize(svg, full_path, thumb_path)
-        print(f"OK    {bk1}_{bk2}.png")
-        generated += 1
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=args.workers, initializer=_init_worker, initargs=(tok_lengths,)
+    ) as executor:
+        futures = [
+            executor.submit(process_pair, bk1, bk2, csv_path)
+            for bk1, bk2, csv_path in tasks
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            status, bk1, bk2 = future.result()
+            if status == "generated":
+                generated += 1
+                print(f"OK    {bk1}_{bk2}.png")
+            else:
+                skipped += 1
 
     print(f"\nDone: {generated} visualizations generated, {skipped} pairs had no text reuse data")
 
