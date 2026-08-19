@@ -362,34 +362,29 @@ def main():
 
     tok_lengths = load_tok_lengths(args.meta_file)
 
-    tasks = list(iter_csv_files(args.data_dir))
+    counts = {"generated": 0, "skipped": 0, "existed": 0}
 
-    generated, skipped, existed = 0, 0, 0
-    if not overwrite:
-        pending = []
-        for bk1, bk2, csv_path in tasks:
-            if outputs_exist(bk1, bk2):
-                existed += 1
-            else:
-                pending.append((bk1, bk2, csv_path))
-        tasks = pending
+    def on_done(future):
+        status, bk1, bk2 = future.result()
+        counts[status] += 1
+        if status == "generated":
+            print(f"OK    {bk1}_{bk2}.png", flush=True)
 
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=args.workers, initializer=_init_worker, initargs=(tok_lengths,)
     ) as executor:
-        futures = [
-            executor.submit(process_pair, bk1, bk2, csv_path)
-            for bk1, bk2, csv_path in tasks
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            status, bk1, bk2 = future.result()
-            if status == "generated":
-                generated += 1
-                print(f"OK    {bk1}_{bk2}.png")
-            else:
-                skipped += 1
+        futures = []
+        for bk1, bk2, csv_path in iter_csv_files(args.data_dir):
+            if not overwrite and outputs_exist(bk1, bk2):
+                counts["existed"] += 1
+                continue
+            future = executor.submit(process_pair, bk1, bk2, csv_path)
+            future.add_done_callback(on_done)
+            futures.append(future)
+        concurrent.futures.wait(futures)
 
-    print(f"\nDone: {generated} visualizations generated, {skipped} pairs had no text reuse data")
+    print(f"\nDone: {counts['generated']} visualizations generated, "
+          f"{counts['skipped']} pairs had no text reuse data")
 
 
 if __name__ == "__main__":
